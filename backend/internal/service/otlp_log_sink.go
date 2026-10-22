@@ -121,7 +121,7 @@ func (s *OTLPLogSink) WriteLogEvent(event *logger.LogEvent) {
 	record.SetObservedTimestamp(time.Now())
 	record.SetSeverityText(levelText)
 	record.SetSeverity(otelSeverity(levelText))
-	record.SetBody(otellog.StringValue(logredact.RedactText(event.Message)))
+	record.SetBody(attribute.StringValue(logredact.RedactText(event.Message)))
 	record.AddAttributes(otelLogAttributes(event)...)
 
 	s.loggerFor(event).Emit(context.Background(), record)
@@ -190,7 +190,7 @@ func otelSeverity(level string) otellog.Severity {
 	}
 }
 
-func otelLogAttributes(event *logger.LogEvent) []otellog.KeyValue {
+func otelLogAttributes(event *logger.LogEvent) []attribute.KeyValue {
 	fields := logredact.RedactMap(event.Fields)
 	if component := otlpEventComponent(event); component != "" {
 		if _, exists := fields["component"]; !exists {
@@ -215,9 +215,9 @@ func otelLogAttributes(event *logger.LogEvent) []otellog.KeyValue {
 	}
 	sort.Strings(keys)
 
-	attributes := make([]otellog.KeyValue, 0, len(keys))
+	attributes := make([]attribute.KeyValue, 0, len(keys))
 	for _, key := range keys {
-		attributes = append(attributes, otellog.KeyValue{Key: key, Value: otelLogValue(canonicalFields[key])})
+		attributes = append(attributes, attribute.KeyValue{Key: attribute.Key(key), Value: otelLogValue(canonicalFields[key])})
 	}
 	return attributes
 }
@@ -235,80 +235,80 @@ func otlpEventComponent(event *logger.LogEvent) string {
 	return component
 }
 
-func otelLogValue(value any) otellog.Value {
+func otelLogValue(value any) attribute.Value {
 	switch v := value.(type) {
 	case nil:
-		return otellog.Value{}
+		return attribute.Value{}
 	case bool:
-		return otellog.BoolValue(v)
+		return attribute.BoolValue(v)
 	case string:
-		return otellog.StringValue(logredact.RedactText(v))
+		return attribute.StringValue(logredact.RedactText(v))
 	case []byte:
-		return otellog.StringValue(logredact.RedactText(string(v)))
+		return attribute.StringValue(logredact.RedactText(string(v)))
 	case int:
-		return otellog.IntValue(v)
+		return attribute.IntValue(v)
 	case int8:
-		return otellog.Int64Value(int64(v))
+		return attribute.Int64Value(int64(v))
 	case int16:
-		return otellog.Int64Value(int64(v))
+		return attribute.Int64Value(int64(v))
 	case int32:
-		return otellog.Int64Value(int64(v))
+		return attribute.Int64Value(int64(v))
 	case int64:
-		return otellog.Int64Value(v)
+		return attribute.Int64Value(v)
 	case uint:
 		return unsignedOTelLogValue(uint64(v))
 	case uint8:
-		return otellog.Int64Value(int64(v))
+		return attribute.Int64Value(int64(v))
 	case uint16:
-		return otellog.Int64Value(int64(v))
+		return attribute.Int64Value(int64(v))
 	case uint32:
-		return otellog.Int64Value(int64(v))
+		return attribute.Int64Value(int64(v))
 	case uint64:
 		return unsignedOTelLogValue(v)
 	case float32:
-		return otellog.Float64Value(float64(v))
+		return attribute.Float64Value(float64(v))
 	case float64:
-		return otellog.Float64Value(v)
+		return attribute.Float64Value(v)
 	case json.Number:
 		if integer, err := v.Int64(); err == nil {
-			return otellog.Int64Value(integer)
+			return attribute.Int64Value(integer)
 		}
 		if decimal, err := v.Float64(); err == nil {
-			return otellog.Float64Value(decimal)
+			return attribute.Float64Value(decimal)
 		}
-		return otellog.StringValue(v.String())
+		return attribute.StringValue(v.String())
 	case time.Time:
-		return otellog.StringValue(v.UTC().Format(time.RFC3339Nano))
+		return attribute.StringValue(v.UTC().Format(time.RFC3339Nano))
 	case error:
-		return otellog.StringValue(logredact.RedactText(v.Error()))
+		return attribute.StringValue(logredact.RedactText(v.Error()))
 	case []any:
-		items := make([]otellog.Value, 0, len(v))
+		items := make([]attribute.Value, 0, len(v))
 		for _, item := range v {
 			items = append(items, otelLogValue(item))
 		}
-		return otellog.SliceValue(items...)
+		return attribute.SliceValue(items...)
 	case map[string]any:
 		keys := make([]string, 0, len(v))
 		for key := range v {
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
-		items := make([]otellog.KeyValue, 0, len(keys))
+		items := make([]attribute.KeyValue, 0, len(keys))
 		for _, key := range keys {
-			items = append(items, otellog.KeyValue{Key: key, Value: otelLogValue(v[key])})
+			items = append(items, attribute.KeyValue{Key: attribute.Key(key), Value: otelLogValue(v[key])})
 		}
-		return otellog.MapValue(items...)
+		return attribute.MapValue(items...)
 	default:
 		if encoded, err := json.Marshal(v); err == nil {
-			return otellog.StringValue(logredact.RedactJSON(encoded))
+			return attribute.StringValue(logredact.RedactJSON(encoded))
 		}
-		return otellog.StringValue(logredact.RedactText(fmt.Sprint(v)))
+		return attribute.StringValue(logredact.RedactText(fmt.Sprint(v)))
 	}
 }
 
-func unsignedOTelLogValue(value uint64) otellog.Value {
+func unsignedOTelLogValue(value uint64) attribute.Value {
 	if value <= math.MaxInt64 {
-		return otellog.Int64Value(int64(value))
+		return attribute.Int64Value(int64(value))
 	}
-	return otellog.StringValue(fmt.Sprintf("%d", value))
+	return attribute.StringValue(fmt.Sprintf("%d", value))
 }

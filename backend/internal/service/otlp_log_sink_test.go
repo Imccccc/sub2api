@@ -170,10 +170,10 @@ func TestOTLPLogResourceServiceName(t *testing.T) {
 	}
 }
 
-func recordAttributes(record sdklog.Record) map[string]otellog.Value {
-	attributes := make(map[string]otellog.Value)
-	record.WalkAttributes(func(kv otellog.KeyValue) bool {
-		attributes[kv.Key] = kv.Value
+func recordAttributes(record sdklog.Record) map[string]attribute.Value {
+	attributes := make(map[string]attribute.Value)
+	record.WalkAttributes(func(kv attribute.KeyValue) bool {
+		attributes[string(kv.Key)] = kv.Value
 		return true
 	})
 	return attributes
