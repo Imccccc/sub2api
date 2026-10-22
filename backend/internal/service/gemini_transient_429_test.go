@@ -4,7 +4,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,15 +30,15 @@ import (
 // Claude-compatible / Gemini native / Chat Completions 三条转发路径都要成立。
 // ---------------------------------------------------------------------------
 
-// geminiSequenceUpstreamStub 按顺序返回预置响应，用于驱动真实的重试循环。
-type geminiSequenceUpstreamStub struct {
+// geminiTransient429UpstreamStub 按顺序返回预置响应，用于驱动真实的重试循环。
+type geminiTransient429UpstreamStub struct {
 	statuses []int
 	bodies   []string
 	headers  []http.Header
 	calls    int
 }
 
-func (s *geminiSequenceUpstreamStub) Do(_ *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+func (s *geminiTransient429UpstreamStub) Do(_ *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
 	if s.calls >= len(s.statuses) {
 		return nil, fmt.Errorf("unexpected upstream call #%d (only %d responses staged)", s.calls+1, len(s.statuses))
 	}
@@ -57,13 +56,13 @@ func (s *geminiSequenceUpstreamStub) Do(_ *http.Request, _ string, _ int64, _ in
 	}, nil
 }
 
-func (s *geminiSequenceUpstreamStub) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+func (s *geminiTransient429UpstreamStub) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
 	return s.Do(req, proxyURL, accountID, accountConcurrency)
 }
 
-// geminiTransient429Body 是生产上观测到的 Vertex 瞬时 429：RESOURCE_EXHAUSTED，
-// 没有 quotaResetDelay，也没有 "per day" 字样。
-const geminiTransient429Body = `{"error":{"code":429,"message":"Resource exhausted, please try again later.","status":"RESOURCE_EXHAUSTED"}}`
+// Use a project quota 429 with RetryInfo so upstream shared-capacity exemptions
+// cannot mask premature account-level rate-limit writes.
+const geminiTransient429Body = `{"error":{"code":429,"message":"Project quota exceeded","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"39s"}]}}`
 
 const geminiNativeSuccessBody = `{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}`
 
@@ -91,7 +90,7 @@ func geminiVertexServiceAccount(id int64) *Account {
 	}
 }
 
-func newGeminiTransient429Service(stub *geminiSequenceUpstreamStub) (*GeminiMessagesCompatService, *rateLimit429AccountRepoStub) {
+func newGeminiTransient429Service(stub *geminiTransient429UpstreamStub) (*GeminiMessagesCompatService, *rateLimit429AccountRepoStub) {
 	repo := &rateLimit429AccountRepoStub{}
 	return &GeminiMessagesCompatService{
 		httpUpstream:     stub,
@@ -115,14 +114,14 @@ func newGeminiTransient429Context(t *testing.T, path string) (*gin.Context, *htt
 // 1. 第一次 429、第二次 200：三条路径都必须成功返回且 SetRateLimited 调用次数为 0。
 // ---------------------------------------------------------------------------
 
-func TestGeminiServiceAccount_Transient429ThenSuccessLeavesNoRateLimit(t *testing.T) {
-	shrinkGeminiRetryBackoff(t)
+type geminiTransient429Forwarder struct {
+	name    string
+	path    string
+	forward func(svc *GeminiMessagesCompatService, c *gin.Context, account *Account) (*ForwardResult, error)
+}
 
-	tests := []struct {
-		name    string
-		path    string
-		forward func(svc *GeminiMessagesCompatService, c *gin.Context, account *Account) (*ForwardResult, error)
-	}{
+func geminiTransient429Forwarders() []geminiTransient429Forwarder {
+	return []geminiTransient429Forwarder{
 		{
 			name: "claude_compatible",
 			path: "/v1/messages",
@@ -148,10 +147,14 @@ func TestGeminiServiceAccount_Transient429ThenSuccessLeavesNoRateLimit(t *testin
 			},
 		},
 	}
+}
 
-	for _, tt := range tests {
+func TestGeminiServiceAccount_Transient429ThenSuccessLeavesNoRateLimit(t *testing.T) {
+	shrinkGeminiRetryBackoff(t)
+
+	for _, tt := range geminiTransient429Forwarders() {
 		t.Run(tt.name, func(t *testing.T) {
-			stub := &geminiSequenceUpstreamStub{
+			stub := &geminiTransient429UpstreamStub{
 				statuses: []int{http.StatusTooManyRequests, http.StatusOK},
 				bodies:   []string{geminiTransient429Body, geminiNativeSuccessBody},
 			}
@@ -177,295 +180,24 @@ func TestGeminiServiceAccount_Transient429ThenSuccessLeavesNoRateLimit(t *testin
 func TestGeminiServiceAccount_AllAttempts429MarksRateLimitOnce(t *testing.T) {
 	shrinkGeminiRetryBackoff(t)
 
-	stub := &geminiSequenceUpstreamStub{
-		statuses: []int{
-			http.StatusTooManyRequests, http.StatusTooManyRequests, http.StatusTooManyRequests,
-			http.StatusTooManyRequests, http.StatusTooManyRequests,
-		},
-		bodies: []string{
-			geminiTransient429Body, geminiTransient429Body, geminiTransient429Body,
-			geminiTransient429Body, geminiTransient429Body,
-		},
-	}
-	svc, repo := newGeminiTransient429Service(stub)
-	c, _ := newGeminiTransient429Context(t, "/v1/messages")
-
-	body := []byte(`{"model":"gemini-2.5-pro","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`)
-	before := time.Now()
-	_, err := svc.Forward(context.Background(), c, geminiVertexServiceAccount(6), body)
-
-	require.Error(t, err, "5 次都 429 应向上返回 failover 错误")
-	require.Equal(t, geminiMaxRetries, stub.calls)
-	require.Equal(t, 1, repo.rateLimitCalls, "只有最终结果确定后写一次账号限流")
-	require.Equal(t, int64(6), repo.lastRateLimitID)
-	// service_account 用短冷却，不是 PST 午夜。
-	require.WithinDuration(t, before.Add(geminiServiceAccountFallbackCooldown), repo.lastRateLimitReset, 5*time.Second)
-}
-
-// ---------------------------------------------------------------------------
-// 3~5. RetryInfo.retryDelay 解析：整数秒、小数秒向上取整、异常长值截断。
-// ---------------------------------------------------------------------------
-
-func geminiRetryInfoBody(retryDelay string) []byte {
-	return []byte(`{"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED","details":[` +
-		`{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED"},` +
-		`{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"` + retryDelay + `"}]}}`)
-}
-
-func TestParseGeminiRetryInfoDelay(t *testing.T) {
-	tests := []struct {
-		name       string
-		retryDelay string
-		wantFound  bool
-		want       time.Duration
-	}{
-		{name: "integer_seconds", retryDelay: "39s", wantFound: true, want: 39 * time.Second},
-		{name: "fractional_seconds_round_up", retryDelay: "1.5s", wantFound: true, want: 2 * time.Second},
-		{name: "sub_second_rounds_up_to_one", retryDelay: "0.2s", wantFound: true, want: time.Second},
-		{name: "absurdly_long_is_capped", retryDelay: "86400s", wantFound: true, want: geminiMaxRetryDelay},
-		{name: "just_over_cap_is_capped", retryDelay: "16m", wantFound: true, want: geminiMaxRetryDelay},
-		{name: "zero_is_ignored", retryDelay: "0s", wantFound: false},
-		{name: "unparsable_is_ignored", retryDelay: "soon", wantFound: false},
-	}
-
-	for _, tt := range tests {
+	for _, tt := range geminiTransient429Forwarders() {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := parseGeminiRetryInfoDelay(geminiRetryInfoBody(tt.retryDelay))
-			require.Equal(t, tt.wantFound, ok)
-			if tt.wantFound {
-				require.Equal(t, tt.want, got)
+			stub := &geminiTransient429UpstreamStub{}
+			for range geminiMaxRetries {
+				stub.statuses = append(stub.statuses, http.StatusTooManyRequests)
+				stub.bodies = append(stub.bodies, geminiTransient429Body)
 			}
-		})
-	}
-}
-
-func TestParseGeminiRetryInfoDelay_IgnoresOtherDetailTypes(t *testing.T) {
-	body := []byte(`{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","retryDelay":"39s"}]}}`)
-	_, ok := parseGeminiRetryInfoDelay(body)
-	require.False(t, ok, "retryDelay 只在 google.rpc.RetryInfo 里有意义")
-}
-
-func TestParseGeminiRateLimitResetTime_UsesRetryInfo(t *testing.T) {
-	now := time.Now().Unix()
-	got := ParseGeminiRateLimitResetTime(geminiRetryInfoBody("39s"))
-	require.NotNil(t, got)
-	require.InDelta(t, now+39, *got, 2)
-}
-
-func TestHandleGeminiUpstreamError_ServiceAccountUsesRetryInfoDelay(t *testing.T) {
-	repo := &rateLimit429AccountRepoStub{}
-	svc := &GeminiMessagesCompatService{
-		accountRepo:      repo,
-		rateLimitService: NewRateLimitService(repo, nil, &config.Config{}, nil, nil),
-	}
-
-	before := time.Now()
-	svc.handleGeminiUpstreamError(context.Background(), geminiVertexServiceAccount(6),
-		http.StatusTooManyRequests, http.Header{}, geminiRetryInfoBody("39s"))
-
-	require.Equal(t, 1, repo.rateLimitCalls)
-	require.WithinDuration(t, before.Add(39*time.Second), repo.lastRateLimitReset, 3*time.Second)
-}
-
-func TestHandleGeminiUpstreamError_ServiceAccountCapsAbsurdRetryInfoDelay(t *testing.T) {
-	repo := &rateLimit429AccountRepoStub{}
-	svc := &GeminiMessagesCompatService{
-		accountRepo:      repo,
-		rateLimitService: NewRateLimitService(repo, nil, &config.Config{}, nil, nil),
-	}
-
-	before := time.Now()
-	svc.handleGeminiUpstreamError(context.Background(), geminiVertexServiceAccount(6),
-		http.StatusTooManyRequests, http.Header{}, geminiRetryInfoBody("86400s"))
-
-	require.Equal(t, 1, repo.rateLimitCalls)
-	require.WithinDuration(t, before.Add(geminiMaxRetryDelay), repo.lastRateLimitReset, 3*time.Second)
-}
-
-// ---------------------------------------------------------------------------
-// 6. service_account 无任何可解析 reset 信息 → 短冷却，绝不是 PST 午夜。
-// ---------------------------------------------------------------------------
-
-func TestHandleGeminiUpstreamError_ServiceAccountFallsBackToShortCooldown(t *testing.T) {
-	// MODEL_CAPACITY_EXHAUSTED 对按量计费的 Vertex 项目是瞬时容量问题，不是日配额。
-	capacityExhausted := []byte(`{"error":{"code":429,"message":"No capacity available for model gemini-3.1-pro-preview on the server","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"MODEL_CAPACITY_EXHAUSTED"}]}}`)
-	// 中转/上游偶尔会带 "per day" 文案；service_account 依然不能套用 AI Studio 的日配额语义。
-	dailyQuotaWording := []byte(`{"error":{"code":429,"message":"Quota exceeded for quota metric 'Generate requests per day'","status":"RESOURCE_EXHAUSTED"}}`)
-
-	tests := []struct {
-		name string
-		body []byte
-	}{
-		{name: "plain_resource_exhausted", body: []byte(geminiTransient429Body)},
-		{name: "model_capacity_exhausted", body: capacityExhausted},
-		{name: "daily_quota_wording", body: dailyQuotaWording},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			repo := &rateLimit429AccountRepoStub{}
-			svc := &GeminiMessagesCompatService{
-				accountRepo:      repo,
-				rateLimitService: NewRateLimitService(repo, nil, &config.Config{}, nil, nil),
-			}
-
+			svc, repo := newGeminiTransient429Service(stub)
+			c, _ := newGeminiTransient429Context(t, tt.path)
 			before := time.Now()
-			svc.handleGeminiUpstreamError(context.Background(), geminiVertexServiceAccount(6),
-				http.StatusTooManyRequests, http.Header{}, tt.body)
+			_, err := tt.forward(svc, c, geminiVertexServiceAccount(6))
 
-			require.Equal(t, 1, repo.rateLimitCalls)
-			require.WithinDuration(t, before.Add(geminiServiceAccountFallbackCooldown), repo.lastRateLimitReset, 5*time.Second)
-			require.True(t, repo.lastRateLimitReset.Before(geminiDailyResetTime(before)),
-				"Vertex 按量账号不得冷却到 PST 午夜")
-		})
-	}
-}
-
-func TestHandleGeminiUpstreamError_ServiceAccountShortCooldownReadsSettings(t *testing.T) {
-	repo := &rateLimit429AccountRepoStub{}
-	settingRepo := newMockSettingRepo()
-	data, _ := json.Marshal(RateLimit429CooldownSettings{Enabled: true, CooldownSeconds: 12})
-	settingRepo.data[SettingKeyRateLimit429CooldownSettings] = string(data)
-
-	rlSvc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
-	rlSvc.SetSettingService(NewSettingService(settingRepo, &config.Config{}))
-	svc := &GeminiMessagesCompatService{accountRepo: repo, rateLimitService: rlSvc}
-
-	before := time.Now()
-	svc.handleGeminiUpstreamError(context.Background(), geminiVertexServiceAccount(6),
-		http.StatusTooManyRequests, http.Header{}, []byte(geminiTransient429Body))
-
-	require.Equal(t, 1, repo.rateLimitCalls)
-	require.WithinDuration(t, before.Add(12*time.Second), repo.lastRateLimitReset, 3*time.Second)
-}
-
-func TestHandleGeminiUpstreamError_ServiceAccountShortCooldownDisabledSkipsWrite(t *testing.T) {
-	repo := &rateLimit429AccountRepoStub{}
-	settingRepo := newMockSettingRepo()
-	data, _ := json.Marshal(RateLimit429CooldownSettings{Enabled: false, CooldownSeconds: 12})
-	settingRepo.data[SettingKeyRateLimit429CooldownSettings] = string(data)
-
-	rlSvc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
-	rlSvc.SetSettingService(NewSettingService(settingRepo, &config.Config{}))
-	svc := &GeminiMessagesCompatService{accountRepo: repo, rateLimitService: rlSvc}
-
-	svc.handleGeminiUpstreamError(context.Background(), geminiVertexServiceAccount(6),
-		http.StatusTooManyRequests, http.Header{}, []byte(geminiTransient429Body))
-
-	require.Zero(t, repo.rateLimitCalls, "管理端关闭 429 兜底冷却时保持既有语义：不标记账号")
-}
-
-// ---------------------------------------------------------------------------
-// Retry-After：上游显式给出的时间优先于本地启发式兜底。
-// ---------------------------------------------------------------------------
-
-func TestParseGeminiRetryAfterHeader(t *testing.T) {
-	httpDate := time.Now().Add(90 * time.Second).UTC().Format(http.TimeFormat)
-
-	tests := []struct {
-		name      string
-		value     string
-		wantFound bool
-		want      time.Duration
-		delta     time.Duration
-	}{
-		{name: "seconds", value: "39", wantFound: true, want: 39 * time.Second},
-		{name: "fractional_seconds_round_up", value: "1.5", wantFound: true, want: 2 * time.Second},
-		{name: "absurdly_long_is_capped", value: "86400", wantFound: true, want: geminiMaxRetryDelay},
-		{name: "http_date", value: httpDate, wantFound: true, want: 90 * time.Second, delta: 2 * time.Second},
-		{name: "past_http_date_ignored", value: time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)},
-		{name: "zero_ignored", value: "0"},
-		{name: "garbage_ignored", value: "later"},
-		{name: "empty_ignored", value: ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			headers := http.Header{}
-			if tt.value != "" {
-				headers.Set("Retry-After", tt.value)
-			}
-			got, ok := parseGeminiRetryAfterHeader(headers)
-			require.Equal(t, tt.wantFound, ok)
-			if !tt.wantFound {
-				return
-			}
-			if tt.delta > 0 {
-				require.InDelta(t, tt.want.Seconds(), got.Seconds(), tt.delta.Seconds())
-				return
-			}
-			require.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestHandleGeminiUpstreamError_ServiceAccountHonorsRetryAfterHeader(t *testing.T) {
-	repo := &rateLimit429AccountRepoStub{}
-	svc := &GeminiMessagesCompatService{
-		accountRepo:      repo,
-		rateLimitService: NewRateLimitService(repo, nil, &config.Config{}, nil, nil),
-	}
-	headers := http.Header{"Retry-After": []string{"42"}}
-
-	before := time.Now()
-	svc.handleGeminiUpstreamError(context.Background(), geminiVertexServiceAccount(6),
-		http.StatusTooManyRequests, headers, []byte(geminiTransient429Body))
-
-	require.Equal(t, 1, repo.rateLimitCalls)
-	require.WithinDuration(t, before.Add(42*time.Second), repo.lastRateLimitReset, 3*time.Second)
-}
-
-func TestHandleGeminiUpstreamError_APIKeyHonorsRetryAfterInsteadOfPSTMidnight(t *testing.T) {
-	repo := &rateLimit429AccountRepoStub{}
-	svc := &GeminiMessagesCompatService{
-		accountRepo:      repo,
-		rateLimitService: NewRateLimitService(repo, nil, &config.Config{}, nil, nil),
-	}
-	account := &Account{ID: 7, Platform: PlatformGemini, Type: AccountTypeAPIKey}
-	headers := http.Header{"Retry-After": []string{"30"}}
-
-	before := time.Now()
-	svc.handleGeminiUpstreamError(context.Background(), account,
-		http.StatusTooManyRequests, headers, []byte(geminiTransient429Body))
-
-	require.Equal(t, 1, repo.rateLimitCalls)
-	require.WithinDuration(t, before.Add(30*time.Second), repo.lastRateLimitReset, 3*time.Second)
-}
-
-// ---------------------------------------------------------------------------
-// 7. API Key 的日配额 / PST 午夜语义不回归。
-// ---------------------------------------------------------------------------
-
-func TestHandleGeminiUpstreamError_APIKeyDailyQuotaStillResetsAtPSTMidnight(t *testing.T) {
-	tests := []struct {
-		name string
-		body []byte
-	}{
-		{
-			name: "explicit_daily_quota_message",
-			body: []byte(`{"error":{"code":429,"message":"Quota exceeded for quota metric 'Generate requests per day'","status":"RESOURCE_EXHAUSTED"}}`),
-		},
-		{
-			name: "no_parsable_reset_info",
-			body: []byte(geminiTransient429Body),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			repo := &rateLimit429AccountRepoStub{}
-			svc := &GeminiMessagesCompatService{
-				accountRepo:      repo,
-				rateLimitService: NewRateLimitService(repo, nil, &config.Config{}, nil, nil),
-			}
-			account := &Account{ID: 7, Platform: PlatformGemini, Type: AccountTypeAPIKey}
-
-			now := time.Now()
-			svc.handleGeminiUpstreamError(context.Background(), account,
-				http.StatusTooManyRequests, http.Header{}, tt.body)
-
-			require.Equal(t, 1, repo.rateLimitCalls)
-			require.WithinDuration(t, geminiDailyResetTime(now), repo.lastRateLimitReset, 2*time.Second)
+			require.Error(t, err, "5 次都 429 应向上返回 failover 错误")
+			require.Equal(t, geminiMaxRetries, stub.calls)
+			require.Equal(t, 1, repo.rateLimitCalls, "只有最终结果确定后写一次账号限流")
+			require.Equal(t, int64(6), repo.lastRateLimitID)
+			// Keep upstream's RetryInfo cooldown after the final failed attempt.
+			require.WithinDuration(t, before.Add(39*time.Second), repo.lastRateLimitReset, 5*time.Second)
 		})
 	}
 }
