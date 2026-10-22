@@ -57,6 +57,9 @@ var (
 		`(?i)\b((?:https?|socks5h?|socks4a?)://)[^/@\s:]+:[^/@\s]+@`,
 	)
 
+	// Gemini auth key：AQ.Ab 前缀 + 48 位，长度放宽以覆盖格式变体。
+	reGeminiAuthKey = regexp.MustCompile(`AQ\.Ab[0-9A-Za-z_-]{40,}`)
+
 	defaultTextRedactPatterns = compileTextRedactPatterns(nil)
 	extraTextPatternCache     sync.Map // map[string]*textRedactPatterns
 )
@@ -113,6 +116,7 @@ func RedactText(input string, extraKeys ...string) string {
 	out := input
 	out = reGOCSPX.ReplaceAllString(out, "GOCSPX-***")
 	out = reAIza.ReplaceAllString(out, "AIza***")
+	out = reGeminiAuthKey.ReplaceAllString(out, "AQ.***")
 	out = reProxyCredentials.ReplaceAllString(out, `${1}***:***@`)
 	out = reEmail.ReplaceAllString(out, "<email-redacted>")
 	out = patterns.reJSONLike.ReplaceAllString(out, `$1***$3`)
